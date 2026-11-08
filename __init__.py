@@ -297,7 +297,8 @@ def on_transform_llm_output(response_text="", session_id="", **kwargs):
         sess = core.load_session(session_id)
         if not sess.get("perf_mode") and not sess.get("targets"):
             return None
-        footer, newest = core.footer_for(response_text, sess)
+        response_text, had_footer = core.split_footer(response_text)
+        footer, newest = core.footer_for(response_text, sess, force=had_footer)
         skip = sess.get("skip")
         if skip and not skip.get("shown"):
             footer = (footer or "\n\n---\n**Perf Lab**") + f"\n- ⚠️ Measuring was skipped in this chat: {skip['reason']}"
@@ -315,7 +316,7 @@ def on_transform_llm_output(response_text="", session_id="", **kwargs):
                 s["unmeasured_shown"] = list(set(s.get("unmeasured_shown", [])) | set(unmeasured))
             core.update_session(session_id, shown_u)
         if not footer:
-            return None
+            return response_text if had_footer else None
         if newest:
             core.update_session(session_id, lambda s: s.__setitem__("last_footer_run", newest))
         return response_text + footer

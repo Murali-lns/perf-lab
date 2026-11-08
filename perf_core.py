@@ -193,10 +193,26 @@ def save_settings(**changes) -> dict:
         return cur
 
 
-def detect_speed_request(text: Any) -> bool:
+# Text Hermes adds to a user turn that the person did not type: recalled memories and
+# gateway notices (finished background jobs, cron results). Speed words inside them
+# ("... completed normally", an old command line) must not switch a chat into speed mode.
+_INJECTED_BLOCKS = re.compile(r"<memory-context>.*?</memory-context>", re.S | re.I)
+_SYSTEM_TURN = re.compile(
+    r"\[INTERNAL NOTIFICATION|^\s*\[IMPORTANT: Background process|^\s*\[SYSTEM:|^\s*\[Cron job", re.M)
+
+
+def human_text(text: Any) -> str:
+    """The part of a user turn that a person typed; empty for gateway notifications."""
     if isinstance(text, list):  # multimodal turns: join the text parts
         text = " ".join(p.get("text", "") for p in text if isinstance(p, dict))
-    return bool(text) and bool(SPEED_WORDS.search(str(text)))
+    text = str(text or "")
+    if _SYSTEM_TURN.search(text):
+        return ""
+    return _INJECTED_BLOCKS.sub(" ", text).strip()
+
+
+def detect_speed_request(text: Any) -> bool:
+    return bool(SPEED_WORDS.search(human_text(text)))
 
 
 # --------------------------------------------------------------------------- commands
@@ -780,7 +796,19 @@ def describe(run: dict, tgt: dict) -> str:
                        new=fmt_s(run.get("after_s") or run.get("median")), ratio=run.get("ratio"), n=run.get("runs"))
 
 
-def footer_for(response_text: str, sess: dict) -> tuple[str | None, str | None]:
+FOOTER_MARK = "\n\n---\n**Perf Lab**"
+
+
+def split_footer(text: str) -> tuple[str, bool]:
+    """The reply without any Perf Lab footer, and whether one was there.
+
+    Hermes can run the output transform more than once on the same reply (seen live
+    after a held turn); stripping first keeps exactly one, up-to-date footer."""
+    idx = (text or "").find(FOOTER_MARK)
+    return (text, False) if idx < 0 else (text[:idx], True)
+
+
+def footer_for(response_text: str, sess: dict, *, force: bool = False) -> tuple[str | None, str | None]:
     """Text to append to the reply, and the newest run id it covers (to avoid repeats)."""
     runs = []
     for tgt in session_targets(sess):
@@ -791,7 +819,7 @@ def footer_for(response_text: str, sess: dict) -> tuple[str | None, str | None]:
     claimed = claims_speed(response_text)
     newest = max((r["at"] for r, _ in runs), default=0)
     newest_id = next((r["id"] for r, _ in runs if r["at"] == newest), None)
-    fresh = newest_id and newest_id != sess.get("last_footer_run")
+    fresh = newest_id and (force or newest_id != sess.get("last_footer_run"))
     lines = []
     if not runs:
         if sess.get("perf_mode") and (claims or claimed):
@@ -805,7 +833,11 @@ def footer_for(response_text: str, sess: dict) -> tuple[str | None, str | None]:
                 lines.append(f"⚠️ {st['target']['label']}: code changed after the last measurement; "
                              "the numbers above are out of date.")
         measured = [r["ratio"] for r, _ in comparisons if r.get("verdict") == "faster" and r.get("ratio")]
+        other = [r["ratio"] for r, _ in comparisons if r.get("verdict") != "faster" and r.get("ratio")]
         for c in claims:
+            if any(abs(c - m) / m <= CLAIM_TOLERANCE for m in other) and not any(
+                    abs(c - m) / m <= CLAIM_TOLERANCE for m in measured):
+                continue  # quoting the plugin's own number for a rejected or unproven run: its line above says why
             if not measured:
                 lines.append(f"⚠️ The reply says {c:g}× faster, but no measured speed-up backs it.")
             elif all(abs(c - m) / m > CLAIM_TOLERANCE for m in measured):
@@ -829,8 +861,9 @@ def summaries(limit: int = 30) -> list[dict]:
         history = []
         for rid in tgt.get("runs", [])[-20:]:
             r = load_run(rid)
-            if r and r.get("median") is not None:
-                history.append({"id": r["id"], "at": r["at"], "median": r["median"], "verdict": r.get("verdict")})
+            if r and r.get("times"):
+                typical = round(statistics.median(quick_half(r["times"])), 4)
+                history.append({"id": r["id"], "at": r["at"], "median": typical, "verdict": r.get("verdict")})
         out.append({
             "id": tgt["id"], "label": tgt.get("label"), "command": tgt.get("command"), "cwd": tgt.get("cwd"),
             "updated": tgt.get("updated"), "baseline": tgt.get("baseline"), "latest": _public_run(run),

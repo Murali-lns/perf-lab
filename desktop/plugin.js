@@ -405,7 +405,7 @@ function Lab() {
                 right: d?.profile ? jsx('span', { className: 'pl-muted', children: `${d.profile.engine} · ${d.profile.samples} samples · ${ago(d.profile.at)}` }) : null,
                 children: jsxs('div', { children: [jsx(Flame, { profile: d?.profile }), jsx(TopList, { profile: d?.profile })] })
               }),
-              tgt?.history?.length > 1 ? jsx(Section, { title: 'History (median time per measurement)', children: jsx(History, { history: tgt.history }) }) : null,
+              tgt?.history?.length > 1 ? jsx(Section, { title: 'History (typical time per measurement)', children: jsx(History, { history: tgt.history }) }) : null,
               jsxs('div', {
                 className: 'pl-foot',
                 children: [
