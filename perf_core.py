@@ -60,7 +60,7 @@ CODE_EXT = (
 EDIT_TOOLS = {"write_file", "patch"}
 SPEED_WORDS = re.compile(
     r"\b(faster|speed\s?-?up|sped\s+up|slow(er|ness|ly)?|optimi[sz](e|es|ed|ing|ation)|"
-    r"performance|perf\b|takes?\s+(too\s+)?long|bottleneck|profil(e|er|ing)|latency|"
+    r"performance|takes?\s+(too\s+)?long|bottleneck|profil(er|ing)|latency|"
     r"quicker|run\s?time)\b",
     re.I,
 )
@@ -212,7 +212,9 @@ def human_text(text: Any) -> str:
 
 
 def detect_speed_request(text: Any) -> bool:
-    return bool(SPEED_WORDS.search(human_text(text)))
+    # The plugin's own name ("Perf Lab", "perf-lab") is not a speed request.
+    text = re.sub(r"\bperf[\s_-]?lab\b", " ", human_text(text), flags=re.I)
+    return bool(SPEED_WORDS.search(text))
 
 
 # --------------------------------------------------------------------------- commands

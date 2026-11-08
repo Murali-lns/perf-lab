@@ -212,6 +212,12 @@ class TestHooks(Base):
         typed = "this is slow, speed it up\n\n<memory-context>\n- unrelated\n</memory-context>"
         self.assertIn("[Perf Lab]", self.pkg.on_pre_llm_call(session_id="n", user_message=typed)["context"])
 
+    def test_talking_about_perf_lab_itself_is_not_a_speed_request(self):
+        for msg in ["record a new video with perf lab opened on the side",
+                    "update the perf-lab README", "set my profile picture"]:
+            self.assertIsNone(self.pkg.on_pre_llm_call(session_id="p", user_message=msg), msg)
+        self.assertIn("[Perf Lab]", self.pkg.on_pre_llm_call(session_id="p", user_message="profile this script, it is slow")["context"])
+
     def test_rules_injected_only_for_speed_requests(self):
         self.assertIsNone(self.pkg.on_pre_llm_call(session_id="c", user_message="rename this variable"))
         self.assertIn("[Perf Lab]", self.speed_turn()["context"])
