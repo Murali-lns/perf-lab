@@ -1,0 +1,22 @@
+name: perf-lab
+version: "0.1.0"
+description: "Proof for speed-ups. Perf Lab times your script before and after the agent optimises it, fingerprints the output so a faster-but-wrong change is rejected, profiles Python with a flame graph, and enforces it with hooks: no edits before a baseline, no 'done' before a re-measure, and the plugin's own measured result appended under the reply."
+manifest_version: 1
+requires_hermes: ">=0.23.0"
+author: Murali-lns
+license: MIT
+homepage: https://github.com/Murali-lns/perf-lab
+kind: standalone
+capabilities: []
+provides_tools:
+  - perf_bench
+  - perf_profile
+  - perf_skip
+provides_hooks:
+  - pre_llm_call
+  - pre_tool_call
+  - post_tool_call
+  - pre_verify
+  - transform_llm_output
+requires_env: []
+python_dependencies: []
