@@ -7,6 +7,15 @@ come from the plugin, not from the model.
 
 Community plugin, not an official Nous Research product. MIT licence.
 
+![Faster, same output](docs/faster.png)
+
+| Rejected: faster, but the output changed | Where the time goes |
+|---|---|
+| ![Rejected](docs/rejected.png) | ![Flame graph](docs/flame-graph.png) |
+
+*Screenshots are frames from a live Hermes Desktop session (real agent, real measurements) on the bundled
+demo script. In the rejected frame the footer appears twice: that was a bug, fixed in this version.*
+
 ## What it does
 
 | Moment | Without Perf Lab | With Perf Lab |
