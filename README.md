@@ -83,10 +83,20 @@ In a chat: *"examples/backtest/backtest.py is slow, make it faster without chang
 
 ## Safety and privacy
 
-- **Runs only interpreters.** `perf_bench` / `perf_profile` accept commands that start with an
-  interpreter (`python`, `node`, `ruby`, `uv run`, ...), never a shell, and refuse inline code
-  (`-c`, `-e`). This keeps them from becoming a way around Hermes' command approvals. A script
-  can still do anything the user can, exactly as when the agent runs it in the terminal.
+- **Asks before every run.** `perf_bench` and `perf_profile` run the command on this machine, so
+  Perf Lab's `pre_tool_call` hook sends each run to Hermes' approval prompt, whether or not the
+  chat is about speed. Answering "always" trusts Perf Lab runs in that one project folder. If the
+  approval cannot be prepared, the run is blocked. With Hermes approvals turned off
+  (`approvals.mode: off` or yolo), runs go ahead without a prompt, like every other approval.
+- **No secrets in the child.** The command runs with a minimal environment: `PATH`, `HOME`, locale,
+  temp dirs, and the virtualenv, conda, uv, node, ruby, julia and R variables it may need. API
+  keys, tokens and anything else in the Hermes environment are not passed on.
+- **Runs only a script through an interpreter.** The program must be an interpreter (`python`,
+  `node`, `ruby`, `uv run <interpreter or .py>`, ...), never a shell, checked by its file name.
+  Inline code is refused anywhere in the command, including joined and bundled forms (`-c`, `-e`,
+  `-cprint(1)`, `-uc`, `--eval=`, `node --run`), as are `deno eval`, `bun x` and remote URLs. These
+  checks keep the command honest; the approval prompt is the safety gate. An approved script can
+  do anything you can, exactly as when the agent runs it in the terminal.
 - **Local only.** No network calls, no telemetry, no credentials read.
 - **What is stored** in `$HERMES_HOME/plugin-data/perf-lab/`: commands, run times, output
   fingerprints, the first 200 KB of each run's normalised stdout (to show what changed),

@@ -6,7 +6,9 @@ directory. Every write is atomic (temp file + ``os.replace``) and serialised wit
 file lock, because the agent and the router are separate module copies.
 
 Nothing here talks to the network. Commands run with an argument list (never a
-shell) and only when the program is a known interpreter.
+shell), only when the program is a known interpreter, and with a minimal environment
+(see ``child_env``). The human approval for each run lives in the agent half's
+``pre_tool_call`` hook.
 """
 
 from __future__ import annotations
@@ -53,6 +55,31 @@ INTERPRETER_RE = re.compile(
     r"^(python(\d+(\.\d+)?)?|pypy3?|node|bun|deno|ruby|perl|php|Rscript|julia|uv)$"
 )
 EVAL_FLAGS = {"-c", "-e", "--eval", "-p", "--print", "-E", "-r"}
+# Short-flag letters that take inline code in some allowed interpreter (python -c, node -e/-p,
+# perl -e/-E, php -r). Also caught when joined ("-cprint(1)") or bundled ("-uc", "-lne").
+EVAL_LETTERS = set("ceEpr")
+# Long options that run inline code or a package.json script (node --run goes through a shell).
+EVAL_LONG = {"--eval", "--print", "--run"}
+NUMBER_RE = re.compile(r"^-\d+(\.\d+)?$")
+# uv run options accepted before the interpreter; anything else is refused rather than guessed.
+UV_VALUE_OPTS = {"--with", "--with-requirements", "--python", "--project", "--directory",
+                 "--extra", "--group", "--package"}
+UV_FLAG_OPTS = {"--no-project", "--frozen", "--locked", "--isolated", "--no-sync", "--all-extras",
+                "--no-dev", "--quiet", "-q", "--offline", "--script"}
+# bun / deno subcommands that run package scripts, install packages or evaluate code.
+RUNNER_DENY = {
+    "bun": {"x", "exec", "add", "a", "install", "i", "create", "update", "remove", "link", "pm", "upgrade"},
+    "deno": {"eval", "repl", "task", "install", "x", "compile", "serve", "jupyter", "upgrade"},
+}
+# The only parent variables a benchmarked script inherits: enough to find interpreters,
+# virtualenvs and caches, never provider keys or other secrets in the Hermes environment.
+CHILD_ENV_KEYS = (
+    "PATH", "HOME", "USER", "LOGNAME", "LANG", "LANGUAGE", "TZ", "TMPDIR", "TEMP", "TMP",
+    "VIRTUAL_ENV", "CONDA_PREFIX", "CONDA_DEFAULT_ENV", "PYTHONPATH", "PYTHONHOME",
+    "PYTHONIOENCODING", "PYTHONUTF8", "UV_CACHE_DIR", "UV_PYTHON", "XDG_CACHE_HOME",
+    "XDG_DATA_HOME", "XDG_CONFIG_HOME", "NODE_PATH", "GEM_HOME", "GEM_PATH", "JULIA_DEPOT_PATH",
+    "R_LIBS_USER", "SYSTEMROOT", "WINDIR", "PATHEXT", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
+)
 CODE_EXT = (
     ".py", ".pyx", ".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".rb", ".go", ".rs",
     ".c", ".cc", ".cpp", ".h", ".hpp", ".java", ".kt", ".jl", ".r", ".R", ".php", ".pl",
@@ -224,6 +251,64 @@ class CommandError(ValueError):
     pass
 
 
+def child_env() -> dict:
+    """Minimal environment for benchmarked and profiled commands (no API keys or tokens)."""
+    env = {k: os.environ[k] for k in CHILD_ENV_KEYS if k in os.environ}
+    env.update({k: v for k, v in os.environ.items() if k.startswith("LC_")})
+    return env
+
+
+def _is_eval_flag(arg: str) -> bool:
+    if arg in EVAL_FLAGS:
+        return True
+    if arg.startswith("--"):
+        return arg.split("=", 1)[0] in EVAL_LONG
+    if not arg.startswith("-") or len(arg) < 2 or NUMBER_RE.match(arg):
+        return False
+    if arg[1] in EVAL_LETTERS:  # joined code: -cprint(1), -e1, -pe
+        return True
+    letters = arg[1:]  # bundled short flags: -uc, -Bc, -lne
+    return letters.isalpha() and len(letters) <= 4 and any(ch in EVAL_LETTERS for ch in letters)
+
+
+def uv_target_index(argv: list[str]) -> int:
+    """Index of what ``uv run`` runs (an interpreter or a .py script), after its options."""
+    if len(argv) < 3 or argv[1] != "run":
+        raise CommandError("uv is allowed only as 'uv run <interpreter or script> ...'")
+    i = 2
+    while i < len(argv) and argv[i].startswith("-"):
+        opt = argv[i].split("=", 1)[0]
+        if opt in UV_FLAG_OPTS:
+            i += 1
+        elif opt in UV_VALUE_OPTS:
+            i += 1 if "=" in argv[i] else 2
+        else:
+            raise CommandError(f"uv run option {opt} is not supported by Perf Lab")
+    if i >= len(argv):
+        raise CommandError("uv run needs an interpreter or a .py script to run")
+    target = argv[i]
+    name = os.path.basename(target)
+    if name == "uv" or not (INTERPRETER_RE.match(name) or target.endswith(".py")):
+        raise CommandError(f"uv run must start an interpreter (python, node, ...) or a .py script, not {target!r}")
+    return i
+
+
+def _check_runner(name: str, rest: list[str]) -> None:
+    """bun and deno double as package managers; allow only running a local script file."""
+    deny = RUNNER_DENY.get(name)
+    if deny is None:
+        return
+    positional = [a for a in rest if not a.startswith("-")]
+    if positional and positional[0] in deny:
+        raise CommandError(f"'{name} {positional[0]}' is not allowed; benchmark a script file")
+    if any("://" in a for a in rest):
+        raise CommandError(f"{name} may run only local script files, not URLs")
+    if positional and positional[0] == "run":
+        positional = positional[1:]
+    if not positional or os.path.splitext(positional[0])[1] not in CODE_EXT:
+        raise CommandError(f"{name} must run a script file, e.g. '{name} run bench.ts'")
+
+
 def parse_command(command: str, cwd: str) -> tuple[list[str], Path]:
     if not isinstance(command, str) or not command.strip():
         raise CommandError("command is empty")
@@ -242,12 +327,13 @@ def parse_command(command: str, cwd: str) -> tuple[list[str], Path]:
     if not INTERPRETER_RE.match(prog):
         raise CommandError(
             f"'{prog}' is not an allowed program. Perf Lab only runs scripts through an interpreter "
-            "(python, node, ruby, uv run, ...), so it never becomes a way around Hermes' command approvals."
+            "(python, node, ruby, uv run, ...)."
         )
-    if prog == "uv" and (len(argv) < 3 or argv[1] != "run"):
-        raise CommandError("uv is allowed only as 'uv run <interpreter or script> ...'")
-    if any(a in EVAL_FLAGS for a in argv[1:4]):
-        raise CommandError("inline code (-c / -e) is not allowed; benchmark a script file")
+    start = uv_target_index(argv) if prog == "uv" else 0
+    _check_runner(os.path.basename(argv[start]), argv[start + 1:])
+    # Checked across the whole command, so a script argument that looks like an eval flag is refused too.
+    if any(_is_eval_flag(a) for a in argv[1:]):
+        raise CommandError("inline code (-c / -e / --eval and joined forms) is not allowed; benchmark a script file")
     return argv, root
 
 
@@ -321,6 +407,7 @@ def _run_once(argv: list[str], root: Path, timeout: float) -> dict:
     try:
         proc = subprocess.run(
             argv, cwd=str(root), stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout,
+            env=child_env(),
         )
     except subprocess.TimeoutExpired:
         return {"seconds": round(time.perf_counter() - start, 4), "exit": None, "timeout": True,
@@ -550,7 +637,8 @@ def profile(command: str, cwd: str, *, timeout_s: float = 120, session_id: str =
     if not 1 <= timeout <= MAX_TIMEOUT_S:
         raise CommandError(f"timeout_s must be 1 to {MAX_TIMEOUT_S}")
     prog = os.path.basename(argv[0])
-    py_argv = argv[2:] if prog == "uv" else argv
+    start = uv_target_index(argv) if prog == "uv" else 0
+    py_argv = argv[start:]
     if not re.match(r"^(python(\d+(\.\d+)?)?|pypy3?)$", os.path.basename(py_argv[0])):
         raise CommandError("profiling supports Python commands only (python script.py ...); "
                            "perf_bench still works for other languages")
@@ -560,12 +648,13 @@ def profile(command: str, cwd: str, *, timeout_s: float = 120, session_id: str =
         cmd = [pyspy, "record", "--format", "raw", "--rate", "200", "--output", str(out_file), "--", *argv]
         engine = "py-spy"
     else:
-        prefix = argv[:2] if prog == "uv" else []
+        prefix = argv[:start]
         cmd = [*prefix, py_argv[0], str(SAMPLER), "--out", str(out_file), "--", *py_argv[1:]]
         engine = "built-in sampler"
     start = time.perf_counter()
     try:
-        proc = subprocess.run(cmd, cwd=str(root), stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout)
+        proc = subprocess.run(cmd, cwd=str(root), stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout,
+                              env=child_env())
         exit_code = proc.returncode
         err = proc.stderr[-1500:].decode("utf-8", "replace")
     except subprocess.TimeoutExpired:

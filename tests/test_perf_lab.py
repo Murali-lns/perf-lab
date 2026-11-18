@@ -8,6 +8,7 @@ Each test maps to an agreed behaviour:
   R5 in a speed chat, editing code before a baseline exists is blocked
   R6 'done' is held when code changed after the last measurement
   R7 only interpreters run; no inline code; hooks fail open on internal errors
+  R8 every perf_bench / perf_profile run asks Hermes' approval (fails closed); children get no secrets
 """
 
 import importlib.util
@@ -155,6 +156,28 @@ class TestCommandSafety(Base):
     def test_r7_no_inline_code(self):
         with self.assertRaises(self.core.CommandError):
             self.core.parse_command(f"{PY} -c 'print(1)'", str(self.proj))
+
+    def test_r7_joined_and_hidden_inline_code_refused(self):
+        for bad in [
+            f"{PY} -cprint(1)", f"{PY} -uc 'print(1)'", f"{PY} -B -X dev -c 'print(1)'",
+            "node --eval=1", "node --print 1", "node -pe 1", "node --run build", "perl -lne 1",
+            "uv run sh -c 'echo hi'", "uv run --with x sh -c 'echo hi'", "uv run ./tool",
+            "uv run --python 3.12 bash x.sh", "uv run --env-file .env python job.py", "uv run uv run x",
+            "uv run python -c 'print(1)'", "deno eval 1", "deno run https://example.com/x.ts",
+            "bun x cowsay", "bun run build",
+        ]:
+            with self.subTest(bad=bad), self.assertRaises(self.core.CommandError):
+                self.core.parse_command(bad, str(self.proj))
+
+    def test_r7_normal_commands_still_allowed(self):
+        for ok in [
+            f"{PY} job.py --year 2024", f"{PY} -X dev job.py", "uv run python job.py",
+            "uv run --with numpy python job.py", "uv run --python=3.12 job.py", "uv run job.py",
+            "node bench.js", "deno run --allow-read bench.ts", "bun run bench.ts", "bun bench.ts",
+            f"{PY} job.py -5",
+        ]:
+            with self.subTest(ok=ok):
+                self.core.parse_command(ok, str(self.proj))
 
     def test_cwd_must_be_absolute(self):
         with self.assertRaises(self.core.CommandError):
@@ -331,6 +354,66 @@ class TestHooks(Base):
             self.assertIsNone(self.pkg.on_transform_llm_output(response_text="hi", session_id="x"))
         finally:
             self.core.load_session = orig
+
+
+class TestRunApprovalAndEnv(Base):
+    """Review of catalog PR #151227: runs need Hermes approval and must not see secrets."""
+
+    def test_runs_ask_for_approval_scoped_to_the_project(self):
+        cmd = self.script(0.01)
+        for tool in ("perf_bench", "perf_profile"):
+            res = self.pkg.on_pre_tool_call(tool_name=tool, args={"command": cmd, "cwd": str(self.proj)},
+                                            session_id="any")
+            self.assertEqual(res["action"], "approve")
+            self.assertEqual(res["rule_key"], f"perf-lab:{self.proj.resolve()}")
+            self.assertIn(cmd, res["message"])
+
+    def test_approval_asked_even_outside_speed_chats_and_with_gate_off(self):
+        self.core.save_settings(gate=False)
+        res = self.pkg.on_pre_tool_call(tool_name="perf_bench", args={"command": self.script(0.01), "cwd": str(self.proj)})
+        self.assertEqual(res["action"], "approve")
+
+    def test_refused_command_gets_no_prompt(self):
+        self.assertIsNone(self.pkg.on_pre_tool_call(tool_name="perf_bench", args={"command": "rm -rf /", "cwd": str(self.proj)}))
+
+    def test_approval_fails_closed(self):
+        orig = self.core.parse_command
+        self.core.parse_command = lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("boom"))
+        try:
+            res = self.pkg.on_pre_tool_call(tool_name="perf_bench", args={"command": "x", "cwd": str(self.proj)})
+        finally:
+            self.core.parse_command = orig
+        self.assertEqual(res["action"], "block")
+
+    def test_bench_child_does_not_see_provider_keys(self):
+        os.environ["OPENROUTER_API_KEY"] = "sk-test-secret"
+        try:
+            cmd = self.script(0, extra="import os; print('leak=' + str('OPENROUTER_API_KEY' in os.environ))")
+            run = self.bench(cmd, runs=1)
+        finally:
+            os.environ.pop("OPENROUTER_API_KEY", None)
+        self.assertEqual(run["verdict"], "baseline")
+        self.assertIn("leak=False", run["output"])
+
+    def test_profile_child_gets_the_minimal_env(self):
+        seen = {}
+        real_run = self.core.subprocess.run
+
+        def spy(cmd, **kw):
+            seen["env"] = kw.get("env")
+            return real_run(cmd, **kw)
+
+        (self.proj / "hot.py").write_text("t = 0\nfor i in range(2_000_000):\n    t += i\nprint(t)\n")
+        os.environ["OPENROUTER_API_KEY"] = "sk-test-secret"
+        self.core.subprocess.run = spy
+        try:
+            self.core.profile(f"{PY} hot.py", str(self.proj))
+        finally:
+            self.core.subprocess.run = real_run
+            os.environ.pop("OPENROUTER_API_KEY", None)
+        self.assertIsNotNone(seen["env"])
+        self.assertNotIn("OPENROUTER_API_KEY", seen["env"])
+        self.assertEqual(seen["env"].get("PATH"), os.environ.get("PATH"))
 
 
 class TestToolsAndProfile(Base):

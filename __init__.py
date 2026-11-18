@@ -7,12 +7,14 @@ Tools
 
 Hooks (only active in chats about speed, and only while the gate setting is on)
   pre_llm_call          notices a speed request and tells the agent the rules for this chat
-  pre_tool_call         blocks edits to code until a baseline exists for that project
+  pre_tool_call         asks the user before perf_bench / perf_profile run a command (always on),
+                        and blocks edits to code until a baseline exists for that project
   post_tool_call        records which files were edited, so old numbers are marked stale
   pre_verify            keeps the turn going if code changed after the last measurement
   transform_llm_output  appends the plugin's own measured result and corrects wrong speed claims
 
-Every hook catches its own errors: a Perf Lab bug must never block the agent.
+Every hook catches its own errors: a Perf Lab bug must never block the agent. The one
+exception is the run approval, which fails closed: if it cannot be built, the run is blocked.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ import time
 log = logging.getLogger("perf_lab")
 
 TOOLSET = "perf_lab"
+RUN_TOOLS = {"perf_bench", "perf_profile"}
 MAX_BLOCKS_PER_FILE = 2
 
 BENCH_SCHEMA = {
@@ -193,7 +196,35 @@ def on_pre_llm_call(session_id="", user_message="", **kwargs):
         return None
 
 
+def run_approval(tool_name: str, args) -> dict | None:
+    """Hermes approval directive for a command Perf Lab is about to run on the host.
+
+    perf_bench / perf_profile execute the model's command directly (not through the terminal
+    tool), so without this they would skip Hermes' command approval. ``rule_key`` is the project
+    folder, so the user's "always" trusts Perf Lab runs in that one project only. A command the
+    tool would refuse anyway gets no prompt. Fails closed: any unexpected error blocks the run."""
+    try:
+        core = _core()
+        args = args if isinstance(args, dict) else {}
+        command = args.get("command")
+        try:
+            _argv, root = core.parse_command(command, args.get("cwd"))
+        except core.CommandError:
+            return None  # the tool itself refuses and explains why
+        shown = command if len(command) <= 300 else command[:297] + "..."
+        return {
+            "action": "approve",
+            "message": f"Perf Lab ({tool_name}) wants to run `{shown}` in {root}",
+            "rule_key": f"perf-lab:{root}",
+        }
+    except Exception:
+        log.warning("perf-lab run approval failed; blocking the run", exc_info=True)
+        return {"action": "block", "message": f"Perf Lab: could not prepare the approval for {tool_name}, so it did not run."}
+
+
 def on_pre_tool_call(tool_name="", args=None, **kwargs):
+    if tool_name in RUN_TOOLS:
+        return run_approval(tool_name, args)
     try:
         core = _core()
         if tool_name not in core.EDIT_TOOLS:
